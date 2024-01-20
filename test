@@ -1,0 +1,290 @@
+import cv2 as cv
+import numpy as np
+import mediapipe as mp
+import math
+import time
+import matplotlib.pyplot as plt
+from collections import Counter
+import rospy
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan 
+from sensor_msgs.msg import CompressedImage
+
+mp_face_mesh = mp.solutions.face_mesh
+
+LEFT_EYE =[362,382,380,374,373,390,249,263,466,388,387,386,385,384,398]
+RIGHT_EYE =[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246]
+RIGHT_IRIS = [474,475,476,477]
+LEFT_IRIS = [469,470,471,472]
+L_H_LEFT = [33]
+L_H_RIGHT = [133]
+R_H_LEFT = [362]
+R_H_RIGHT = [263]
+L_V_UP = [159]
+L_V_DOWN = [145]
+R_V_UP = [386]
+R_V_DOWN = [374]
+
+def euclidean_distance(point1, point2):
+    x1, y1 = point1.ravel()
+    x2, y2 = point2.ravel()
+    distance = math.sqrt((x2-x1)**2 + (y2-y1)**2)
+    return distance
+
+def iris_position_H(iris_center, right_point, left_point):
+    center_to_right_dist = euclidean_distance(iris_center, right_point)
+    total_distance = euclidean_distance(right_point, left_point)
+    ratio = center_to_right_dist/total_distance
+    iris_position = ""
+    if ratio < 0.42:
+        iris_position = "right"
+    elif ratio > 0.42 and ratio < 0.57:
+        iris_position = "center"
+    else:
+        iris_position = "left"
+    return iris_position, ratio
+
+def iris_position_V(iris_center, top_point, bottom_point):
+    global vertical_distance
+    ratio = vertical_distance/3
+    iris_position = ""
+    if ratio > 6 :
+        iris_position = "up"
+    elif ratio < 6  and ratio > 3:
+        iris_position = "center"
+    else:
+        iris_position = "down"
+    return iris_position, ratio
+
+def image_callback(ros_data):
+    np_arr = np.fromstring(ros_data.data, np.uint8)
+    frame = cv.imdecode(np_arr, cv.IMREAD_COLOR)
+
+    rospy.Subscriber("/raspicam_node/image/compressed", CompressedImage, image_callback)  # เพิ่ม subscriber
+
+def main():
+    blink_timer = None
+    global vertical_distance
+    
+
+    time_list = []
+    iris_position_list = []
+    filtered_position_list = []
+    filter_window_size = 10
+
+    frame_count = 0
+    start_time = time.time()
+
+    with mp_face_mesh.FaceMesh(
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as face_mesh:
+        rospy.init_node('turtlebot_motion_pose', anonymous=True)
+        print("main")
+        # Declare velocity publisher
+        cmd_vel_topic = '/cmd_vel'
+        pub = rospy.Publisher(cmd_vel_topic, Twist, queue_size=10)
+        rate = rospy.Rate(10)  # 10Hz
+
+        move = Twist()
+        move.linear.x = 0
+        move.angular.z = 0
+        obstacle_detected = False
+
+        def lidar_callback(data):
+            nonlocal obstacle_detected
+
+            front_sector = data.ranges[0:5]
+
+            if any(distance < 0.3 and distance != 0 for distance in front_sector):
+                obstacle_detected = True
+            else:
+                obstacle_detected = False
+
+        rospy.Subscriber("/scan", LaserScan, lidar_callback)  # เพิ่ม subscriber
+
+        # ตัวแปรสำหรับจัดการประวัติการตรวจสอบสิ่งกีดขวาง
+        obstacle_history = []
+
+        while not rospy.is_shutdown():
+            # Read compressed image from the topic
+            compressed_img_msg = rospy.wait_for_message('/raspicam_node/image/compressed', CompressedImage)
+            np_arr = np.fromstring(compressed_img_msg.data, np.uint8)
+            frame = cv.imdecode(np_arr, cv.IMREAD_COLOR)
+
+            frame = cv.flip(frame, 1)
+            rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            img_h, img_w = frame.shape[:2]
+            results = face_mesh.process(rgb_frame)
+
+            # Rest of your processing code...
+            if results.multi_face_landmarks:
+                mesh_points = np.array([np.multiply([p.x, p.y], [img_w, img_h]).astype(int) for p in results.multi_face_landmarks[0].landmark])
+
+                vertical_distance = euclidean_distance(mesh_points[R_V_UP[0]], mesh_points[R_V_DOWN[0]])
+
+                (l_cx, l_cy), l_radius = cv.minEnclosingCircle(mesh_points[LEFT_IRIS])
+                (r_cx, r_cy), r_radius = cv.minEnclosingCircle(mesh_points[RIGHT_IRIS])
+                center_left = np.array([l_cx, l_cy], dtype=np.int32)
+                center_right = np.array([r_cx, r_cy], dtype=np.int32)
+                cv.circle(frame, center_left, int(l_radius), (255, 0, 255), 1, cv.LINE_AA)
+                cv.circle(frame, center_right, int(r_radius), (255, 0, 255), 1, cv.LINE_AA)
+
+                cv.line(frame, (center_left[0] - 10, center_left[1] - 10), (center_left[0] + 10, center_left[1] + 10),
+                        (255, 0, 255), 1, cv.LINE_AA)
+                cv.line(frame, (center_left[0] - 10, center_left[1] + 10), (center_left[0] + 10, center_left[1] - 10),
+                        (255, 0, 255), 1, cv.LINE_AA)
+
+                # Draw 'x' at the center of right iris
+                cv.line(frame, (center_right[0] - 10, center_right[1] - 10), (center_right[0] + 10, center_right[1] + 10),
+                        (255, 0, 255), 1, cv.LINE_AA)
+                cv.line(frame, (center_right[0] - 10, center_right[1] + 10), (center_right[0] + 10, center_right[1] - 10),
+                        (255, 0, 255), 1, cv.LINE_AA)
+
+                iris_pos_h, ratio_h = iris_position_H(center_right, mesh_points[R_H_RIGHT][0], mesh_points[R_H_LEFT][0])
+                iris_pos_v, ratio_v = iris_position_V(center_right, mesh_points[R_V_UP][0], mesh_points[R_V_DOWN][0])
+
+                combined_position = ""
+                #if iris_pos_v == "up" and iris_pos_h == "left":
+                #    combined_position = "up-left"
+                if iris_pos_v == "up" and iris_pos_h == "center":
+                    combined_position = "up" #ใช้เป็นหลัก
+                #elif iris_pos_v == "up" and iris_pos_h == "right":
+                #    combined_position = "up-right"
+                #elif iris_pos_v == "down" and iris_pos_h == "left":
+                #    combined_position = "down-left"
+                elif iris_pos_v == "down" and iris_pos_h == "center":
+                    combined_position = "down" #ใช้เป็นหลัก
+                #elif iris_pos_v == "down" and iris_pos_h == "right":
+                #    combined_position = "down-right"
+                elif iris_pos_v == "center" and iris_pos_h == "left":
+                    combined_position = "left" #ใช้เป็นหลัก
+                elif iris_pos_v == "center" and iris_pos_h == "right":
+                    combined_position = "right" #ใช้เป็นหลัก
+                else:
+                    combined_position = "center" #ใช้เป็นหลัก
+
+                frame_count += 1
+
+                if time.time() - start_time >= 1.0:
+                    fps = frame_count/(time.time() - start_time)
+                    print(f"FPS: {fps:.2f}")
+                    frame_count = 0
+                    start_time = time.time()
+
+                if iris_pos_v == "down":
+                    if not blink_timer:
+                        blink_timer = time.time()
+                    else:
+                        current_time = time.time()
+                        time_difference = current_time - blink_timer
+                        if time_difference < 1.0:
+                            cv.putText(
+                                frame,
+                                "Blink detected",
+                                (30, 120),
+                                cv.FONT_HERSHEY_PLAIN,
+                                1.2,
+                                (0, 0, 255),
+                                1,
+                                cv.LINE_AA
+                            )
+                else:
+                    blink_timer = None
+
+
+
+                cv.circle(frame, center_left, 2, (0, 255, 0), -1)
+                cv.circle(frame, center_right, 2, (0, 255, 0), -1)
+
+                ##print(iris_pos)
+                cv.putText(
+                    frame,
+                    f"Iris Pos: {combined_position}",
+                    (30, 90),
+                    cv.FONT_HERSHEY_PLAIN,
+                    1.2,
+                    (0, 255, 0),
+                    1,
+                    cv.LINE_AA
+                )
+
+                # Append the current time and iris position to the lists
+                current_time = time.time()
+                time_list.append(current_time)
+                iris_position_list.append(combined_position)
+
+                # Apply a simple moving average filter to smooth the signal
+                if len(iris_position_list) >= filter_window_size:
+                    # Get the last 'filter_window_size' positions
+                    window_positions = iris_position_list[-filter_window_size:]
+                    position_counts = Counter(window_positions)
+                    most_common_position = position_counts.most_common(1)[0][0]
+                    filtered_position_list.append(most_common_position)
+                else:
+                    filtered_position_list.append(combined_position)
+
+                last_position = filtered_position_list[-1]
+
+#เช็คtypeของfiltered_position_list แปลงค่าออกมาเป็นarrayให้ได้หรือดูว่าต้องใช้typeอะไรในการเขียน เดาว่าอาจจะใช้string
+
+                if obstacle_detected:
+                # ถ้ามีสิ่งกีดขวางให้หยุดทำงาน
+                    move.linear.x = 0.0
+                    move.angular.z = 0.0
+                    rospy.loginfo("Obstacle detected. Stopping TurtleBot.")
+                else:
+                    print("Start Run")
+                    if last_position == "down":
+                        move.linear.x = 0.1
+                        move.angular.z = 0.0
+                    elif last_position == "left":
+                        move.linear.x = 0.0
+                        move.angular.z = 0.1
+                    elif last_position == "right":
+                        move.linear.x = 0.0
+                        move.angular.z = -0.1
+                    else: 
+                        last_position == "center"
+                        move.linear.x = 0.0
+                        move.angular.z = 0.0
+
+            # Publish the movement command
+            pub.publish(move)
+            rate.sleep()
+
+            # Rest of your code for visualization and key event handling...
+            # Plot the iris position in real-time
+            plt.clf()
+            plt.plot(time_list[-len(filtered_position_list):], iris_position_list[-len(filtered_position_list):], label='Iris Position')
+            plt.plot(time_list[-len(filtered_position_list):], filtered_position_list, label='Filtered Iris Position')
+            plt.xlabel('Time')
+            plt.ylabel('Iris Position')
+            plt.title('Real-Time Iris Position and Filtered Iris Position')
+            plt.legend()
+            plt.pause(0.01)
+
+            cv.imshow('Iris Tracking', frame)
+
+            obstacle_history.append(obstacle_detected)
+
+                # ครวจสอบประวัติการตรวจสอบสิ่งกีดขวาง
+            if len(obstacle_history) > 10:
+                    # ให้ดูเฉพาะ 10 รอบล่าสุด
+                if all(obstacle_history[-10:]):  # ถ้ามีสิ่งกีดขวางในทุกรอบ
+                    rospy.loginfo("Obstacle detected consistently. Stopping TurtleBot.")
+                    move.linear.x = 0.0
+                    move.angular.z = 0.0
+                    pub.publish(move)
+
+            key = cv.waitKey(1)
+            if key == ord('q'):
+                break
+
+        # Release resources
+        cv.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
